@@ -1,0 +1,164 @@
+#include "SystemStatusPoller.h"
+
+// Qt
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+
+SystemStatusPoller::SystemStatusPoller(QObject *parent)
+    : ApiClientBase(parent)
+{
+    connect(&_timer, &QTimer::timeout, this, &SystemStatusPoller::poll);
+    connect(this, &ApiClientBase::serverUrlChanged, this, [this](const QString &) {
+        _isConnected = false;
+        emit statusUpdated();
+        poll();
+    });
+}
+
+void SystemStatusPoller::startPolling()
+{
+    if (!_timer.isActive()) {
+        _timer.start(PollIntervalMs);
+    }
+    poll();
+}
+
+void SystemStatusPoller::stopPolling()
+{
+    _timer.stop();
+}
+
+void SystemStatusPoller::poll()
+{
+    QNetworkReply *reply = network().get(QNetworkRequest(endpoint(ApiRoutes::System)));
+    connect(reply, &QNetworkReply::finished, this, [this, reply]()
+    {
+        reply->deleteLater();
+        if (reply->error() != QNetworkReply::NoError) {
+            if (_isConnected) {
+                _log.warn(QString("Lost connection to carbon-engine daemon: %1").arg(reply->errorString()));
+            }
+            _isConnected = false;
+            _engineStatus = "Disconnected";
+            _databaseStatus = "Offline";
+            _jobQueue = "—";
+            _cpuLoad = "—";
+            _memoryUsage = "—";
+            _gpuLoad = "—";
+            _gpuOffload = "—";
+            _vramUsage = "—";
+            _tokenRate = "—";
+            _activeModel = "Unavailable";
+            _cloudPacingStatus = "Offline";
+            emit statusUpdated();
+            return;
+        }
+
+        auto doc = QJsonDocument::fromJson(reply->readAll());
+        if (!doc.isObject()) {
+            if (_isConnected) {
+                _log.warn("Invalid JSON object received from /api/system");
+            }
+            _isConnected = false;
+            _engineStatus = "Invalid Response";
+            emit statusUpdated();
+            return;
+        }
+
+        bool wasConnected = _isConnected;
+        _isConnected = true;
+        if (!wasConnected) {
+            _log.info("Established connection to carbon-engine daemon.");
+        }
+
+        QJsonObject obj = doc.object();
+
+        // 1. Job queue
+        int queueDepth = obj.value("job_queue_depth").toInt(0);
+        _jobQueue = QString::number(queueDepth);
+
+        // 2. CPU
+        double cpuProc = obj.value("cpu_pct_process").toDouble(0.0);
+        double cpuSys  = obj.value("cpu_pct_system").toDouble(0.0);
+        _cpuLoad = QString("%1% (%2% sys)").arg(QString::number(cpuProc, 'f', 1), QString::number(cpuSys, 'f', 1));
+
+        // 3. Memory
+        qint64 memProc = obj.value("memory_used_mb_process").toInteger();
+        qint64 memSys  = obj.value("memory_used_mb_system").toInteger();
+        qint64 memTotal = obj.value("memory_total_mb_system").toInteger();
+        if (memTotal > 0) {
+            double sysUsedGb = static_cast<double>(memSys) / 1024.0;
+            _memoryUsage = QString("%1 MB (%2 GB sys)").arg(QString::number(memProc), QString::number(sysUsedGb, 'f', 1));
+        } else if (memSys > 0) {
+            _memoryUsage = QString("%1 MB (%2 MB sys)").arg(QString::number(memProc), QString::number(memSys));
+        } else {
+            _memoryUsage = QString("%1 MB").arg(QString::number(memProc));
+        }
+
+        // 4. GPU & Offload metrics
+        bool gpuPresent = obj.value("gpu_present").toBool(false);
+        QJsonValue gpuPctVal = obj.value("gpu_pct");
+        if (!gpuPresent || gpuPctVal.isNull()) {
+            _gpuLoad = "N/A";
+        } else {
+            _gpuLoad = QString("%1%").arg(QString::number(gpuPctVal.toDouble(0.0), 'f', 1));
+        }
+
+        qint64 vramUsedMb = obj.value("vram_used_mb").toInteger();
+        qint64 vramTotalMb = obj.value("vram_total_mb").toInteger();
+        if (gpuPresent && vramTotalMb > 0) {
+            if (vramUsedMb > 0) {
+                if (vramTotalMb >= 1024) {
+                    double usedGb = static_cast<double>(vramUsedMb) / 1024.0;
+                    double totGb = static_cast<double>(vramTotalMb) / 1024.0;
+                    int pct = static_cast<int>(std::round((static_cast<double>(vramUsedMb) / static_cast<double>(vramTotalMb)) * 100.0));
+                    _vramUsage = QString("%1 / %2 GB (%3%)")
+                                     .arg(QString::number(usedGb, 'f', 1))
+                                     .arg(QString::number(totGb, 'f', 1))
+                                     .arg(pct);
+                } else {
+                    int pct = static_cast<int>(std::round((static_cast<double>(vramUsedMb) / static_cast<double>(vramTotalMb)) * 100.0));
+                    _vramUsage = QString("%1 / %2 MB (%3%)").arg(vramUsedMb).arg(vramTotalMb).arg(pct);
+                }
+            } else {
+                if (vramTotalMb >= 1024) {
+                    double totGb = static_cast<double>(vramTotalMb) / 1024.0;
+                    _vramUsage = QString("%1 GB").arg(QString::number(totGb, 'f', 1));
+                } else {
+                    _vramUsage = QString("%1 MB").arg(vramTotalMb);
+                }
+            }
+        } else {
+            _vramUsage = "N/A";
+        }
+
+        _gpuOffload = obj.value("gpu_offload_mode").toString(gpuPresent ? "Full GPU" : "CPU");
+
+        // 5. Engine status
+        _engineStatus = obj.value("engine_status").toString("Idle");
+
+        // 6. Database status
+        _databaseStatus = obj.value("db_status").toString("Idle");
+
+        // 7. Token rate
+        double tps = obj.value("tokens_per_sec").toDouble(0.0);
+        if (tps > 0.0) {
+            _tokenRate = QString("%1 t/s").arg(QString::number(tps, 'f', 1));
+        } else if (_engineStatus == "Inferencing" || _engineStatus == "Processing") {
+            _tokenRate = "Calculating...";
+        } else {
+            _tokenRate = "—";
+        }
+
+        // 8. Cloud Telemetry
+        _cloudEnabled = obj.value("cloud_enabled").toBool(false);
+        _activeEngineMode = obj.value("active_engine_mode").toString(EngineMode::Offline);
+        _activeModel = obj.value("active_model").toString(Models::LocalGemmaName);
+        _cloudPacingStatus = obj.value("cloud_pacing_status").toString("IDLE");
+        _apiKeyConfigured = obj.value("api_key_configured").toBool(false);
+
+        emit statusUpdated();
+    });
+}
