@@ -33,7 +33,7 @@ When filing a bug report, please include the following details:
 - **Display Configuration**: Screen resolution and DPI scaling factor (e.g., 4K at 150%).
 - **Software Toolchain**:
   - Compiler: MSVC 2022 (v143+), GCC 13+, or Clang 17+
-  - Qt Framework: Qt 6.5+ (specifically `Qt6::Core`, `Qt6::Gui`, `Qt6::Qml`, `Qt6::Quick`, `Qt6::WebEngineQuick`)
+  - Qt Framework: Qt 6.10+ (specifically `Qt6::Core`, `Qt6::Gui`, `Qt6::Qml`, `Qt6::Quick`, `Qt6::WebEngineQuick`)
   - CMake: Version 3.20+
   - Build Generator: Ninja
 

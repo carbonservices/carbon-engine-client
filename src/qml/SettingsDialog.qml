@@ -343,7 +343,7 @@ Popup {
                             }
 
                             Button {
-                                text: "Cloud Run (HTTPS)"
+                                text: "Cloud Run"
                                 flat: true
                                 Layout.preferredHeight: 22
                                 background: Rectangle {
